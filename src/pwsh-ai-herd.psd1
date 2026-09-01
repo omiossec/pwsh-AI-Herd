@@ -1,6 +1,6 @@
 @{
     RootModule        = 'pwsh-ai-herd.psm1'
-    ModuleVersion     = '0.1.0'
+    ModuleVersion     = '0.1.2'
     GUID              = '9b37fec9-6d8e-4726-b3d8-a888bd7704f2'
     Author            = 'Olivier Miossec'
     Copyright         = '(c) 2026 Olivier Miossec. All rights reserved.'
