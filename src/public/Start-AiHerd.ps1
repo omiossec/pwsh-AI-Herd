@@ -22,12 +22,24 @@ function Start-AiHerd {
         Limitation: frames talk to their process through redirected pipes, not a PTY.
         Line-oriented CLI programs work fine (ping, az, terraform, scripts, REPLs, ...);
         full-screen TUI programs (vim, htop, ...) will not render correctly. Coding agents must
-        therefore be started in their non-interactive / streaming mode.
+        therefore be started in their non-interactive / streaming mode: a bare 'claude' sees a
+        redirected stdin, treats it as a piped one-shot prompt, and exits 1 with
+        'no stdin data received' before the TUI ever appears.
 
-    .PARAMETER Command
-        Zero to six command lines to start immediately, one frame per command line.
-        The first token is the executable, the rest is passed as arguments.
-        Quote the executable ("...") if its path contains spaces.
+    .PARAMETER NumberOfSession
+        How many agent sessions to start immediately, 0 to 6, one frame each.
+        Defaults to 0, which opens an empty layout you fill from the top bar.
+
+    .PARAMETER WorkingDirectory
+        Directory every frame's process starts in. Defaults to the current location.
+
+    .PARAMETER Agent
+        Which coding agent CLI the sessions run: Claude, Copilot, or Codex.
+        Defaults to Claude. The agent's executable must be on PATH.
+
+        Claude is launched in its streaming JSON mode, which is the only one of the three that
+        keeps stdin open for a multi-turn conversation over a pipe. Copilot and Codex have no
+        equivalent stdin protocol yet, so they are started bare and read a single prompt.
 
     .EXAMPLE
         Start-AiHerd
@@ -35,25 +47,67 @@ function Start-AiHerd {
         Starts the host with an empty layout; add frames from the top bar.
 
     .EXAMPLE
-        Start-AiHerd -Command 'ping 127.0.0.1', 'pwsh -NoProfile -Command "1..999 | ForEach-Object { $_; Start-Sleep 1 }"'
+        Start-AiHerd -NumberOfSession 3
 
-        Starts the host with two frames already running.
+        Starts three Claude sessions side by side.
+
+    .EXAMPLE
+        Start-AiHerd -NumberOfSession 2 -Agent Codex
+
+        Starts two Codex sessions side by side.
+
+    .EXAMPLE
+        Start-AiHerd -NumberOfSession 2 -WorkingDirectory C:\repos\contoso
+
+        Starts two Claude sessions in C:\repos\contoso instead of the current location.
 
     .NOTES
         Prerequisite (once): Install-Module Microsoft.PowerShell.ConsoleGuiTools -Scope CurrentUser
+
+        A Claude frame runs non-interactively, so it cannot answer a permission prompt: any
+        tool call that would need approval is refused. Add the permission flags you want to
+        the command line in the top bar (--permission-mode, --allowedTools, ...) before
+        pressing [Add frame].
     #>
     [CmdletBinding()]
     param(
         [Parameter()]
-        [ValidateCount(0, 6)]
-        [string[]]$Command = @()
+        [ValidateRange(0, 6)]
+        [int]$NumberOfSession = 0,
+
+        [Parameter()]
+        [ValidateSet('Claude', 'Copilot', 'Codex')]
+        [string]$Agent = 'Claude',
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$WorkingDirectory
     )
 
     $ErrorActionPreference = 'Stop'
 
+    # Agent name => command line started in each frame.
+    #
+    # Claude: --print is what stops it from trying to open its full-screen UI on a pipe, and
+    # the stream-json pair is what keeps stdin open between turns instead of reading one
+    # prompt to EOF. --verbose is required by --print with stream-json output.
+    $agentCommandLine = @{
+        Claude  = 'claude --print --verbose --input-format stream-json --output-format stream-json'
+        Copilot = 'copilot'
+        Codex   = 'codex'
+    }[$Agent]
+
     Import-TerminalGui
 
+    # A child process inherits the host *process* directory, which is not the PowerShell
+    # location: resolve the location here so every frame starts where the user is standing.
+    if (-not $PSBoundParameters.ContainsKey('WorkingDirectory')) {
+        $WorkingDirectory = if ($PWD.Provider.Name -eq 'FileSystem') { $PWD.ProviderPath } else { [Environment]::CurrentDirectory }
+    }
+    $WorkingDirectory = (Resolve-Path -Path $WorkingDirectory).ProviderPath
+
     # Module-scope state, shared with the private frame functions. Reset on every run.
+    $script:WorkingDirectory = $WorkingDirectory
     $script:MaxFrame = 6
     $script:MaxLine  = 300      # scroll-back kept per frame
     $script:Frames   = [System.Collections.Generic.List[psobject]]::new()
@@ -62,7 +116,7 @@ function Start-AiHerd {
         [Terminal.Gui.Application]::Init()
         $top = [Terminal.Gui.Application]::Top
 
-        $window = [Terminal.Gui.Window]::new("AI Herd | pwsh $($PSVersionTable.PSVersion) | max $script:MaxFrame frames")
+        $window = [Terminal.Gui.Window]::new("AI Herd | $Agent | $WorkingDirectory | max $script:MaxFrame frames")
 
         # --- top bar: command input + [Add frame] + [Quit] -----------------------
         $topBar        = [Terminal.Gui.FrameView]::new('New frame command')
@@ -71,9 +125,8 @@ function Start-AiHerd {
         $topBar.Width  = [Terminal.Gui.Dim]::Fill()
         $topBar.Height = 3
 
-        $defaultCommand = if ($IsWindows) { 'ping -t 127.0.0.1' } else { 'ping 127.0.0.1' }
-
-        $commandField       = [Terminal.Gui.TextField]::new($defaultCommand)
+        # Pre-filled with the selected agent, so [Add frame] adds one more of the same.
+        $commandField       = [Terminal.Gui.TextField]::new($agentCommandLine)
         $commandField.X     = 0
         $commandField.Y     = 0
         $commandField.Width = [Terminal.Gui.Dim]::Fill(24)
@@ -99,11 +152,15 @@ function Start-AiHerd {
         $top.Add($window)
 
         # $commandField is a local of this function, so the handler needs its own closure to
-        # still see it when Terminal.Gui raises the event later.
+        # still see it when Terminal.Gui raises the event later. The closure also drops the
+        # module session state, so New-Frame is called through its FunctionInfo: by name it
+        # would not resolve from the handler.
+        $newFrameCommand = Get-Command -Name 'New-Frame'
+
         $addButton.add_Clicked({
             $commandLine = $commandField.Text.ToString()
             if (-not [string]::IsNullOrWhiteSpace($commandLine)) {
-                New-Frame -CommandLine $commandLine
+                & $newFrameCommand -CommandLine $commandLine
             }
         }.GetNewClosure())
 
@@ -111,9 +168,9 @@ function Start-AiHerd {
             [Terminal.Gui.Application]::RequestStop()
         })
 
-        # Frames requested on the command line
-        foreach ($commandLine in $Command) {
-            New-Frame -CommandLine $commandLine
+        # Sessions requested on the command line
+        for ($i = 0; $i -lt $NumberOfSession; $i++) {
+            New-Frame -CommandLine $agentCommandLine
         }
 
         # UI refresh pump: runs on the main loop thread, so PowerShell script blocks are safe here.

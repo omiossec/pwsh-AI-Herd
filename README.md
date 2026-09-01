@@ -60,17 +60,25 @@ Start an empty host and add frames from the top bar:
 Start-AiHerd
 ```
 
-Start with frames already running — up to six command lines, one frame each:
+Start with agent sessions already running — up to six, one frame each:
 
 ```powershell
-Start-AiHerd -Command 'ping 127.0.0.1', 'pwsh -NoProfile -File ./watch.ps1'
+Start-AiHerd -NumberOfSession 3
 ```
 
-Quote the executable if its path contains spaces; everything after the first token is passed
-through as arguments:
+Pick the agent with `-Agent` (`Claude`, `Copilot`, or `Codex`; defaults to `Claude`). Its
+executable has to be on `PATH`:
 
 ```powershell
-Start-AiHerd -Command '"C:\Program Files\Git\bin\git.exe" log --oneline -20'
+Start-AiHerd -NumberOfSession 2 -Agent Codex
+```
+
+The top bar is pre-filled with the selected agent's command, so **[Add frame]** adds another
+session of the same kind. Overwrite the field to run anything else — the first token is the
+executable, the rest is passed as arguments, and a path with spaces goes in quotes:
+
+```
+"C:\Program Files\Git\bin\git.exe" log --oneline -20
 ```
 
 ### Controls
@@ -104,7 +112,7 @@ render correctly — start agents in their non-interactive, print, or streaming 
 
 ## Roadmap
 
-- Agent presets, so you can say `claude` or `codex` instead of a raw command line
+- Per-agent argument presets (non-interactive / streaming flags), not just the bare executable
 - Git worktree per agent: create it on request, run the agent there, clean it up on close
 - Publish to the PowerShell Gallery
 

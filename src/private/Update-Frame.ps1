@@ -15,7 +15,17 @@ function Update-Frame {
         $line    = $null
 
         while ($frame.Process.Output.TryDequeue([ref]$line)) {
-            $frame.Lines.Add($line)
+            if ($frame.Protocol -eq 'StreamJson') {
+                # Bookkeeping events render to nothing, and PowerShell unrolls that empty
+                # array to $null on the way out: @() first, then only add when there is something.
+                $rendered = @(Format-AgentEvent -Line $line)
+                if ($rendered.Count -gt 0) {
+                    $frame.Lines.AddRange([string[]]$rendered)
+                }
+            }
+            else {
+                $frame.Lines.Add($line)
+            }
             $changed = $true
         }
 

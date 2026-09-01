@@ -18,6 +18,9 @@ src/
     00-FrameProcess.ps1    Add-Type of the C# child-process wrapper
   private/
     Test-ConsoleGuiTools.ps1  is ConsoleGuiTools installed? (bool, optional -MinimumVersion)
+    Format-AgentEvent.ps1  one stream-json line -> display lines
+    Get-EventContent.ps1   strict-mode-safe $event.message.content
+    Get-EventSummary.ps1   arbitrary payload -> one short line
     Import-TerminalGui.ps1 loads Terminal.Gui/NStack at run time
     Split-CommandLine.ps1  executable + argument string
     New-Frame.ps1          starts a process, builds its FrameView
@@ -98,22 +101,47 @@ State lives in module scope, shared by every module function and reset at the to
   `New-Frame`, without it every button acts on the last-created frame. For `$commandField` in
   `Start-AiHerd` it matters even more now that the code is a function and not a top-level
   script: the variable is a local, so the handler would see nothing when the event fires later.
+- **`.GetNewClosure()` drops the module session state.** A closure cannot resolve
+  module-private functions by name — Terminal.Gui surfaces `The term 'Send-FrameInput' is not
+  recognized...` — and `$script:` state reads back empty. Capture the command outside the
+  handler (`$sendCommand = Get-Command -Name 'Send-FrameInput'`) and call it as
+  `& $sendCommand -Frame $frame`: invoking the `FunctionInfo` runs the function in its own
+  module scope. Scriptblocks used *without* `.GetNewClosure()` keep module scope, which is why
+  the `AddTimeout` `Update-Frame` delegate works as written.
 - Closing a frame calls `Process.Kill(entireProcessTree: true)`; the `finally` block does the
   same for all remaining frames and then `Application::Shutdown()`. Never add an early `exit`
   path that skips it, or child agents survive the host.
 - Pipes, not a PTY. Line-oriented CLIs work; full-screen TUI programs (vim, htop) will not
   render. Coding agents must therefore be launched in their non-interactive / print / stream
-  modes, not their full-screen UI.
+  modes, not their full-screen UI. A bare `claude` sees the redirected stdin, takes it for a
+  piped one-shot prompt, and exits 1 with `no stdin data received`.
+- Frames have a `Protocol`, derived in `New-Frame` from whether the command line contains
+  `--input-format stream-json`. `StreamJson` frames wrap what you type in a user-message
+  envelope on the way in (`Send-FrameInput`) and run each output line through
+  `Format-AgentEvent` on the way out; `Text` frames pass both through untouched.
+- A child process inherits the *host process* directory, which is not the PowerShell location
+  the user sees. `Start-AiHerd` resolves `$PWD` into `$script:WorkingDirectory` and every
+  frame starts there; the window title shows which directory is in play.
+- Editing `src/class/00-FrameProcess.ps1` needs a **new shell** to take effect: the
+  `-as [type]` guard means `Import-Module -Force` reuses the type already compiled into the
+  session.
 - `Split-CommandLine` is deliberately simple: leading `"..."` for a quoted executable, first
   space otherwise. It does not do full shell tokenization.
 
 ## Planned scope (not implemented yet)
 
-- Agent presets: named agent definitions (claude, codex, ...) instead of raw command lines.
+- Agent argument presets. Claude is done: `claude --print --verbose --input-format
+  stream-json --output-format stream-json`, the only mode of the three that keeps stdin open
+  across turns. Copilot and Codex are still the bare executables — `copilot -p` and
+  `codex exec` read one prompt to EOF, so a multi-turn frame needs something else (their ACP
+  / MCP server modes are the likely route).
+- Permissions in a Claude frame. Non-interactive means no permission prompt can be answered,
+  so a tool call needing approval is refused; the flags (`--permission-mode`,
+  `--allowedTools`) have to be typed into the top bar for now.
 - Git worktree management: create a worktree per agent on request, launch the agent with that
   worktree as its working directory, and clean it up when the frame closes. `FrameProcess`
-  currently has no working-directory support — adding `StartInfo.WorkingDirectory` is the
-  first step.
+  now takes a working directory (third constructor argument) and `New-Frame` has a
+  `-WorkingDirectory` parameter, so the remaining work is creating and removing the worktrees.
 - The C# namespace is still `FrameHost` from the prototype; rename it when nothing else is
   in flight, keeping the `-as [type]` guard (`Add-Type` cannot redefine a type in a session,
   so a stale name lingers until the shell restarts).

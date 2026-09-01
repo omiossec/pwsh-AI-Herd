@@ -3,15 +3,30 @@ function New-Frame {
     .SYNOPSIS
         Starts a child process for the given command line and adds its frame to the grid.
 
+    .PARAMETER WorkingDirectory
+        Directory the process starts in. Defaults to the location Start-AiHerd was run from:
+        a child process otherwise inherits the host process directory, which is not the
+        PowerShell location the user sees.
+
     .NOTES
         The button/key handlers capture $frame, so they must be built with .GetNewClosure():
         without it every handler would act on the last frame created.
+
+        .GetNewClosure() has a price: the closure loses the module session state, so a handler
+        cannot resolve module-private functions by name (Terminal.Gui reports 'The term
+        Send-FrameInput is not recognized...'). Calling through the FunctionInfo captured in
+        the closure runs the function in its own module scope, where the private helpers and
+        the $script: state are visible again.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string]$CommandLine
+        [string]$CommandLine,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$WorkingDirectory = $script:WorkingDirectory
     )
 
     if ($script:Frames.Count -ge $script:MaxFrame) {
@@ -19,9 +34,13 @@ function New-Frame {
         return
     }
 
+    # Agents launched with --input-format stream-json speak newline-delimited JSON on both
+    # pipes; anything else is treated as a plain line-oriented CLI.
+    $protocol = if ($CommandLine -match '--input-format\s+stream-json') { 'StreamJson' } else { 'Text' }
+
     $parsed = Split-CommandLine -CommandLine $CommandLine
     try {
-        $process = [FrameHost.FrameProcess]::new($parsed.FileName, $parsed.Arguments)
+        $process = [FrameHost.FrameProcess]::new($parsed.FileName, $parsed.Arguments, $WorkingDirectory)
     }
     catch {
         $err = $_
@@ -59,18 +78,23 @@ function New-Frame {
         Input       = $inputField
         Lines       = [System.Collections.Generic.List[string]]::new()
         CommandLine = $CommandLine
+        Protocol    = $protocol
+        Directory   = $WorkingDirectory
         ExitNoted   = $false
     }
     $script:Frames.Add($frame)
 
-    $sendButton.add_Clicked({ Send-FrameInput -Frame $frame }.GetNewClosure())
-    $closeButton.add_Clicked({ Close-Frame -Frame $frame }.GetNewClosure())
+    $sendCommand  = Get-Command -Name 'Send-FrameInput'
+    $closeCommand = Get-Command -Name 'Close-Frame'
+
+    $sendButton.add_Clicked({ & $sendCommand -Frame $frame }.GetNewClosure())
+    $closeButton.add_Clicked({ & $closeCommand -Frame $frame }.GetNewClosure())
 
     # Enter inside the input field == [Send]
     $inputField.add_KeyPress({
         param($keyEventArgs)
         if ($keyEventArgs.KeyEvent.Key -eq [Terminal.Gui.Key]::Enter) {
-            Send-FrameInput -Frame $frame
+            & $sendCommand -Frame $frame
             $keyEventArgs.Handled = $true
         }
     }.GetNewClosure())

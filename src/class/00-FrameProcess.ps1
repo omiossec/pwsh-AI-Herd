@@ -23,6 +23,11 @@ namespace FrameHost
         public ConcurrentQueue<string> Output { get; } = new ConcurrentQueue<string>();
 
         public FrameProcess(string fileName, string arguments)
+            : this(fileName, arguments, null)
+        {
+        }
+
+        public FrameProcess(string fileName, string arguments, string workingDirectory)
         {
             _process = new Process();
             _process.StartInfo.FileName               = fileName;
@@ -32,6 +37,13 @@ namespace FrameHost
             _process.StartInfo.RedirectStandardOutput = true;
             _process.StartInfo.RedirectStandardError  = true;
             _process.StartInfo.RedirectStandardInput  = true;
+
+            // Left empty the child inherits the host process directory, which is not the
+            // PowerShell location the user started the host from.
+            if (!string.IsNullOrEmpty(workingDirectory))
+            {
+                _process.StartInfo.WorkingDirectory = workingDirectory;
+            }
 
             _process.OutputDataReceived += (s, e) => { if (e.Data != null) { Output.Enqueue(e.Data); } };
             _process.ErrorDataReceived  += (s, e) => { if (e.Data != null) { Output.Enqueue("! " + e.Data); } };
