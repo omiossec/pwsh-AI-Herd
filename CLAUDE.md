@@ -7,16 +7,23 @@ worktree per agent so the agents do not fight over the same working tree.
 
 ## Current state
 
-Working module, one public command. The prototype script that this grew out of has been
-folded into `src/` and deleted from the root.
+Working module with two backends:
+
+- **Frame host** (`Start-AiHerd`): the original Terminal.Gui window with pipe-driven frames.
+  Agents run in their non-interactive stream-json mode. Zero external dependency beyond
+  ConsoleGuiTools.
+- **WezTerm grid** (`*-AiGrid*`): the PowerShell counterpart of `sam/agentic-config`
+  (zsh + tmux, kept in the repo as the reference). PowerShell drives `wezterm cli` to build a
+  window of real PTY panes, one interactive agent each, and records the grid so it can be
+  reopened. This is the direction the project is going; the frame host stays as fallback.
 
 ```
 src/
-  pwsh-ai-herd.psd1        manifest (FunctionsToExport = Start-AiHerd)
+  pwsh-ai-herd.psd1        manifest (FunctionsToExport lists every public function)
   pwsh-ai-herd.psm1        loader: dot-sources class -> private -> public, exports public
   class/
-    00-FrameProcess.ps1    Add-Type of the C# child-process wrapper
-  private/
+    00-FrameProcess.ps1    Add-Type of the C# child-process wrapper (frame host)
+  private/                 -- frame host --
     Test-ConsoleGuiTools.ps1  is ConsoleGuiTools installed? (bool, optional -MinimumVersion)
     Format-AgentEvent.ps1  one stream-json line -> display lines
     Get-EventContent.ps1   strict-mode-safe $event.message.content
@@ -29,8 +36,28 @@ src/
     Send-FrameInput.ps1    stdin write
     Update-Frame.ps1       120 ms pump (queue -> view)
     Update-FrameView.ps1   redraw one frame's list
+                           -- WezTerm grid --
+    Get-WezTermPath.ps1    locate wezterm (PATH, then default install dirs), throws with hint
+    Invoke-WezTermCli.ps1  `wezterm cli <args>` -> stdout; throws on failure; -Quiet probes
+    Get-WezTermPane.ps1    `wezterm cli list --format json` as objects
+    Wait-WezTermPane.ps1   poll for a pane id not in a known set (after `wezterm start`)
+    Get-HerdStatePath.ps1  %LOCALAPPDATA%\pwsh-ai-herd | $XDG_STATE_HOME/pwsh-ai-herd
+    Get-HerdGridPath.ps1   grid file for a project dir (md5 of the normalised path)
+    Get-GridGeometry.ps1   N -> columns x rows (columns >= rows), or explicit matrix
+    Get-AgentEffort.ps1    default/medium/low spread over N panes (last = low)
+    Get-AgentPaneCommand.ps1  the ONLY place that knows how to launch/resume each agent
+    New-HerdWorktree.ps1   idempotent `git worktree add` on branch herd/<session>-<n>
+    New-HerdGrid.ps1       the builder: window + splits + save (launch AND reopen)
+    Save-HerdGrid.ps1 / Read-HerdGrid.ps1   grid JSON in and out
+    Resolve-HerdGrid.ps1   which grid a command targets (-Path, $env:WEZTERM_PANE, cwd)
   public/
-    Start-AiHerd.ps1       the entry point: builds the window, runs the Terminal.Gui loop
+    Start-AiHerd.ps1       frame host entry point
+    Start-AiGrid.ps1       sam:   new grid (-Count | -Columns/-Rows, -Agent, -Worktree, -Kickoff)
+    Resume-AiGrid.ps1      sr:    reopen a recorded grid, each pane resuming its session
+    Get-AiGrid.ps1         list recorded grids
+    Add-AiGridAgent.ps1    gadd:  split one more tracked pane off the grid
+    Send-AiGridText.ps1    gbcast: paste text + Enter into every live pane
+    Remove-AiGridWorktree.ps1  gwt clean: remove the grid's worktrees (-DeleteBranch)
 ```
 
 Rules that fall out of the loader:
@@ -53,10 +80,18 @@ Import-Module ./src/pwsh-ai-herd.psd1 -Force
 `Start-AiHerd` itself needs a real console (see below).
 
 `Invoke-ScriptAnalyzer -Path ./src -Recurse` is clean apart from three accepted warnings:
-`PSUseShouldProcessForStateChangingFunctions` on the internal TUI helpers,
+`PSUseShouldProcessForStateChangingFunctions` on the internal helpers (TUI ones plus
+`New-HerdGrid` / `New-HerdWorktree`; the public `*-AiGrid*` commands carry ShouldProcess
+instead, so a private helper prompting too would double the confirmations),
 `PSReviewUnusedParameter` on the `param($MainLoop)` that the `Func[MainLoop,bool]` timer
 signature requires, and `PSUseSingularNouns` on `Test-ConsoleGuiTools`, whose noun is the
 literal module name.
+
+The WezTerm grid logic can be exercised without WezTerm: inside the module scope
+(`& (Get-Module pwsh-ai-herd) { ... }`) redefine `Get-WezTermPath`, `Invoke-WezTermCli` and
+`Get-WezTermPane` with fakes that hand out pane ids, then call `Start-AiGrid`. The recorded
+call sequence for 5 panes must be: spawn, split right 67, split right 50, split bottom 50 on
+column 0, split bottom 50 on column 1 (that is the tmux `_grid_build` order).
 
 ## Requirements
 
@@ -128,7 +163,65 @@ State lives in module scope, shared by every module function and reset at the to
 - `Split-CommandLine` is deliberately simple: leading `"..."` for a quoted executable, first
   space otherwise. It does not do full shell tokenization.
 
+## WezTerm grid architecture
+
+Mirror of `sam/agentic-config/lib/grid.zsh`, with wezterm in the tmux role:
+
+| tmux (agentic-config)                    | here                                              |
+| ---------------------------------------- | ------------------------------------------------- |
+| `tmux new-session` / `split-window -P`   | `wezterm cli spawn --new-window` / `split-pane` (both print the new pane id) |
+| `tmux send-keys`                         | `wezterm cli send-text` (paste) + `--no-paste "\r"` for Enter |
+| `@grid_uuid`, `@agent_task` pane options | the grid JSON (per pane: SessionId, Agent, Effort, Task, Worktree, Branch, PaneId) plus `HERD_*` env vars and `herd_*` wezterm user vars set by the pane's own startup script |
+| `$TMUX_PANE`                             | `$env:WEZTERM_PANE` (used by `Resolve-HerdGrid`) |
+| `; exec zsh` tail                        | the pane runs `pwsh -NoLogo -NoExit -Command <script>` |
+
+Rules that matter:
+
+- **One builder.** `Start-AiGrid` and `Resume-AiGrid` both end in `New-HerdGrid`; the only
+  difference is `-Resume`, which `Get-AgentPaneCommand` turns into `claude --resume <id>` /
+  `codex resume --last`. Never open panes anywhere else (except the single split in
+  `Add-AiGridAgent`).
+- **Pane command = pwsh script string.** `Get-AgentPaneCommand` builds a single-quoted-only
+  PowerShell line (quotes doubled) so it survives the Windows argument round trip
+  pwsh -> wezterm -> pwsh. Do not introduce double quotes into it.
+- **Always `wezterm cli --no-auto-start`** (done once, in `Invoke-WezTermCli`). Plain
+  `wezterm cli` auto-starts a headless `wezterm-mux-server` when no GUI runs; the reachability
+  probe then succeeds and the whole grid is spawned into an invisible server. Seen on the
+  first real run.
+- **Tell the CLI where the GUI socket is.** From a non-WezTerm console, the 20240203 Windows
+  build fails with `failed to connect to Socket("gui-sock-<pid>")` because it resolves that
+  name relative to the current directory. `Get-WezTermSocket` picks the live `gui-sock-<pid>`
+  (pid checked against running `wezterm-gui` processes; stale files linger) under
+  `~/.local/share/wezterm` and `Invoke-WezTermCli` passes it through `WEZTERM_UNIX_SOCKET`
+  for the duration of the call. Inside a pane the variable is already set and is used as is.
+- **Open a fresh window with `wezterm-gui start`, not `wezterm start`.** The console proxy
+  handed over and the GUI did not survive on Windows; launching `wezterm-gui.exe` (sibling of
+  `wezterm.exe`) directly works.
+- **`wezterm start` is asynchronous and prints nothing**, so a fresh window's first pane is
+  found by diffing `wezterm cli list` (`Wait-WezTermPane`). When a GUI is already running,
+  `wezterm cli spawn --new-window` is used and prints the id directly.
+- **PaneId is live-only.** It identifies a pane inside the current wezterm process; on reopen
+  it is reset and re-assigned. SessionId is the durable identity.
+- **Layout order** is columns first (top row, left to right), then rows row-major, so the
+  last index lands bottom-right. Split percentages are relative to the pane being split:
+  column c gets `(remaining)/(remaining+1)`, row r gets `(cnt-r)/(cnt-r+1)`.
+- Worktrees live under `<state>/worktrees/<session>/<n>` on branch `herd/<session>-<n>`;
+  `Remove-AiGridWorktree` keeps branches unless `-DeleteBranch`, since merging back is manual.
+
 ## Planned scope (not implemented yet)
+
+WezTerm grid, in rough priority order:
+
+- `wezterm.lua` snippet: show `herd_task` in the tab/status line and a "waiting" marker set
+  by Claude `Stop`/`Notification` hooks (the `pane-tint.sh` equivalent; hooks get
+  `HERD_SESSION_ID` and `WEZTERM_PANE` from the pane environment).
+- Squads (`squads/<name>/squad.conf` -> label, effort, kickoff per pane); the pane spec
+  already carries Task/Kickoff/Effort for it.
+- Jump to next waiting pane (`wezterm cli activate-pane`), token total in the status line.
+- Not yet verified on a real WezTerm: the whole `*-AiGrid*` path was validated against fakes
+  only (see "Current state"). First real run: `Start-AiGrid -Count 2 -WhatIf`, then without.
+
+Frame host:
 
 - Agent argument presets. Claude is done: `claude --print --verbose --input-format
   stream-json --output-format stream-json`, the only mode of the three that keeps stdin open

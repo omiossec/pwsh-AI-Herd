@@ -6,21 +6,23 @@ line-oriented CLI), each with its own PID, its own output pane, and its own inpu
 
 ```
 ┌ New frame command ───────────────────────────────────────────────────┐
-│ claude -p "refactor the parser"          [ Add frame ]   [ Quit ]    │
+│ claude --print --verbose --input-form…    [ Add frame ]   [ Quit ]   │
 └──────────────────────────────────────────────────────────────────────┘
-┌ PID 4812 | claude -p ... ──────────┐┌ PID 9134 | codex exec ... ─────┐
-│ Reading src/parser.ps1             ││ Analysing repository…          │
-│ Found 3 call sites                 ││ ! warning: no tests found      │
-│ > yes, go ahead                    ││                                │
-│                                    ││                                │
+┌ PID 4812 | claude --print ... ─────┐┌ PID 9134 | codex exec ... ─────┐
+│ -- session started | claude-opus-5 ││ Analysing repository…          │
+│ > refactor the parser              ││ ! warning: no tests found      │
+│ [tool] Read                        ││                                │
+│ Found 3 call sites in src/parser.p ││                                │
 │ [input________________] Send Close ││ [input______________] Send Close│
 └────────────────────────────────────┘└─────────────────────────────────┘
 ```
 
 ## Status
 
-Early. `Start-AiHerd` works today: it hosts the frames, streams output, and forwards input.
-Agent presets and git worktree isolation are on the roadmap, not implemented yet.
+Early, but usable. `Start-AiHerd` hosts the frames, streams output, and forwards input, and
+frames start in the directory you launched it from. Claude has a working preset, which makes
+a frame a multi-turn conversation. Copilot and Codex are still started as bare executables,
+and git worktree isolation is on the roadmap.
 
 ## Requirements
 
@@ -73,6 +75,13 @@ executable has to be on `PATH`:
 Start-AiHerd -NumberOfSession 2 -Agent Codex
 ```
 
+Every frame starts in your current location, so `cd` to the repository first. Override it with
+`-WorkingDirectory`; the directory in play is shown in the window title:
+
+```powershell
+Start-AiHerd -NumberOfSession 2 -WorkingDirectory C:\repos\contoso
+```
+
 The top bar is pre-filled with the selected agent's command, so **[Add frame]** adds another
 session of the same kind. Overwrite the field to run anything else — the first token is the
 executable, the rest is passed as arguments, and a path with spaces goes in quotes:
@@ -80,6 +89,34 @@ executable, the rest is passed as arguments, and a path with spaces goes in quot
 ```
 "C:\Program Files\Git\bin\git.exe" log --oneline -20
 ```
+
+### Agents
+
+A coding agent reached through a pipe has to be told not to open its full-screen UI and — if
+the frame is to be a conversation rather than a single shot — to keep reading stdin between
+turns. `-Agent Claude` therefore starts:
+
+```
+claude --print --verbose --input-format stream-json --output-format stream-json
+```
+
+In that mode the frame speaks the agent's JSON protocol on both pipes: what you type is
+wrapped in a user message on the way in, and the events coming back are rendered as plain
+text — assistant replies, `[tool] Read`, `[tool result] ...`, `-- turn complete (1488 ms) --`.
+Any command line containing `--input-format stream-json` gets this treatment, including one
+you type yourself; everything else is treated as a plain line-oriented CLI.
+
+Two things to know:
+
+- A bare `claude` **will not work**. It sees the redirected stdin, takes it for a piped
+  one-shot prompt, and exits with `Warning: no stdin data received`.
+- A non-interactive session cannot answer a permission prompt, so a tool call that needs
+  approval is refused. Add the flags you want (`--permission-mode`, `--allowedTools`, ...) to
+  the command line in the top bar before pressing **[Add frame]**.
+
+`-Agent Copilot` and `-Agent Codex` are still the bare `copilot` and `codex` executables.
+Neither has an equivalent stdin protocol yet — `copilot -p` and `codex exec` read a single
+prompt to end-of-input — so they behave as one-shot frames for now.
 
 ### Controls
 
@@ -93,6 +130,52 @@ executable, the rest is passed as arguments, and a path with spaces goes in quot
 
 Frames are laid out automatically on a grid (1×1, 2×1, 2×2, 3×2) as you add and close them.
 Each frame keeps the last 300 lines of scroll-back, and stderr lines are prefixed with `! `.
+
+## Interactive grid (WezTerm backend)
+
+The frame host above talks to agents through pipes, so they run in their non-interactive
+mode. The `*-AiGrid` commands take the other route: they drive [WezTerm](https://wezterm.org)
+the way [agentic-config](sam/agentic-config) drives tmux. Every agent gets a real terminal
+pane, runs its normal full-screen UI, and the PowerShell side only does the herding: layout,
+pinned session ids, git worktrees, reopen, broadcast.
+
+Requirements: WezTerm installed (`winget install wez.wezterm`, `brew install --cask wezterm`,
+or your distribution's package), `git` for worktrees, and the agent executables on `PATH`.
+On Windows on ARM the x64 build runs under emulation.
+
+```powershell
+Start-AiGrid                       # 4 Claude agents, 2 x 2, in the current directory
+Start-AiGrid -Count 6              # 6 agents, 3 columns x 2 rows
+Start-AiGrid -Columns 3 -Rows 1    # explicit matrix
+Start-AiGrid -Agent Mixed          # alternate Claude / Codex panes
+Start-AiGrid -Worktree             # one git worktree + branch (herd/<session>-<n>) per agent
+Start-AiGrid -Kickoff 'Read CLAUDE.md, then wait for instructions.'
+```
+
+Every Claude pane is launched with a pinned `--session-id`, and the grid (directory, layout,
+one record per pane) is saved per project directory under `%LOCALAPPDATA%\pwsh-ai-herd`
+(`$XDG_STATE_HOME/pwsh-ai-herd` elsewhere). That makes the grid reopenable:
+
+```powershell
+Get-AiGrid                         # recorded grids, newest first
+Resume-AiGrid                      # reopen the grid of the current directory, each pane resuming its conversation
+Get-AiGrid | Select-Object -First 1 | Resume-AiGrid
+```
+
+Inside a grid (from any pane, or from the project directory):
+
+```powershell
+Add-AiGridAgent -Agent Codex -Task review     # add a tracked pane
+Send-AiGridText 'Run the tests and report failures only.'   # broadcast a prompt to every pane
+Remove-AiGridWorktree                        # remove this grid's worktrees (branches are kept unless -DeleteBranch)
+```
+
+Effort is spread like the tmux version: the last pane runs low, roughly a quarter run
+medium, the rest run at the default level (`CLAUDE_CODE_EFFORT_LEVEL` for Claude,
+`-c model_reasoning_effort` for Codex). Each pane also exports `HERD_SESSION_ID`,
+`HERD_AGENT` and `HERD_TASK`, and sets the WezTerm user vars `herd_task` and
+`herd_session_id`, so a `wezterm.lua` status bar or Claude hooks can label panes and flag the
+ones waiting on you.
 
 ## How it works
 
@@ -112,8 +195,11 @@ render correctly — start agents in their non-interactive, print, or streaming 
 
 ## Roadmap
 
-- Per-agent argument presets (non-interactive / streaming flags), not just the bare executable
-- Git worktree per agent: create it on request, run the agent there, clean it up on close
+- WezTerm grid: a `wezterm.lua` snippet showing pane labels and a "waiting on you" marker
+  fed by Claude hooks, squads (preconfigured teams with roles), and jump-to-waiting-pane
+- Streaming presets for Copilot and Codex, most likely through their ACP / MCP server modes
+- Git worktree per agent in the frame host (the WezTerm grid already has it)
+- Permission handling for non-interactive agents, instead of flags typed into the top bar
 - Publish to the PowerShell Gallery
 
 ## Contributing
@@ -121,6 +207,10 @@ render correctly — start agents in their non-interactive, print, or streaming 
 Issues and pull requests are welcome. The module layout and its conventions are documented in
 [CLAUDE.md](CLAUDE.md): `src/class`, `src/private`, and `src/public`, one function per file
 with the file name matching the function name.
+
+`Import-Module -Force` picks up any script change, but **not** a change to the inline C# in
+`src/class`: `Add-Type` cannot redefine a type in a running session, so start a new shell
+after touching it.
 
 ```powershell
 Test-ModuleManifest -Path ./src/pwsh-ai-herd.psd1
