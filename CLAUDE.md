@@ -12,8 +12,9 @@ Working module with two backends:
 - **Frame host** (`Start-AiHerd`): the original Terminal.Gui window with pipe-driven frames.
   Agents run in their non-interactive stream-json mode. Zero external dependency beyond
   ConsoleGuiTools.
-- **WezTerm grid** (`*-AiGrid*`): the PowerShell counterpart of `sam/agentic-config`
-  (zsh + tmux, kept in the repo as the reference). PowerShell drives `wezterm cli` to build a
+- **WezTerm grid** (`*-AiGrid*`): the PowerShell counterpart of *agentic-config*
+  (a zsh + tmux tool, the design reference; no longer in this repo). PowerShell drives
+  `wezterm cli` to build a
   window of real PTY panes, one interactive agent each, and records the grid so it can be
   reopened. This is the direction the project is going; the frame host stays as fallback.
 
@@ -74,7 +75,13 @@ Validate a change with:
 ```powershell
 Test-ModuleManifest -Path ./src/pwsh-ai-herd.psd1
 Import-Module ./src/pwsh-ai-herd.psd1 -Force
+./test/Invoke-Test.ps1
 ```
+
+`test/` holds a Pester 5 file per function (see `test/README.md` for the fixtures and the two
+traps: never `.GetNewClosure()` a mock body, and compute `-Skip` flags at file scope). The
+suite needs no terminal and no WezTerm. Two tests are skipped on purpose, each pinned next to
+an active test recording the current broken behaviour; both are listed under "Known defects".
 
 `Import-Module` compiles the C# type, so it catches most breakage without a terminal.
 `Start-AiHerd` itself needs a real console (see below).
@@ -165,7 +172,8 @@ State lives in module scope, shared by every module function and reset at the to
 
 ## WezTerm grid architecture
 
-Mirror of `sam/agentic-config/lib/grid.zsh`, with wezterm in the tmux role:
+Mirror of the `lib/grid.zsh` engine from *agentic-config* (the zsh + tmux reference tool, no
+longer checked into this repo), with wezterm in the tmux role:
 
 | tmux (agentic-config)                    | here                                              |
 | ---------------------------------------- | ------------------------------------------------- |
@@ -207,6 +215,22 @@ Rules that matter:
   column c gets `(remaining)/(remaining+1)`, row r gets `(cnt-r)/(cnt-r+1)`.
 - Worktrees live under `<state>/worktrees/<session>/<n>` on branch `herd/<session>-<n>`;
   `Remove-AiGridWorktree` keeps branches unless `-DeleteBranch`, since merging back is manual.
+
+## Known defects
+
+Both were found by the test suite and are recorded there as skipped tests stating the intended
+behaviour, beside an active test pinning what happens today. Fix the code, then un-skip.
+
+- **`Start-AiGrid` throws for a single agent.** `Get-AgentEffort -Count 1` returns a
+  one-element array that PowerShell unrolls to the bare string `default`; `Start-AiGrid` then
+  indexes it as an array, so `$effort[$i]` yields the character `d`. `Get-AgentPaneCommand`
+  rejects that through its `ValidateSet`, so `Start-AiGrid -Count 1` and `-Columns 1 -Rows 1`
+  fail outright. Fix: `$effort = @(Get-AgentEffort -Count $n)` in `Start-AiGrid`.
+- **`Get-EventSummary` cannot read an array of content blocks.** `switch` enumerates a
+  collection, so the `{ $_ -is [array] }` clause is dead and the `default` clause inspects
+  `$Value` (the whole argument) instead of `$_` (the current element). A `tool_result` whose
+  content is a list of blocks renders in the frame as raw JSON rather than its text. Fix:
+  handle the array before the switch, and use `$_` inside it.
 
 ## Planned scope (not implemented yet)
 
