@@ -15,7 +15,15 @@
     # would force an import the module does not need. The presence check stays in code.
     RequiredModules   = @()
 
-    FunctionsToExport = @('Start-AiHerd')
+    FunctionsToExport = @(
+        'Start-AiHerd',
+        'Start-AiGrid',
+        'Resume-AiGrid',
+        'Get-AiGrid',
+        'Add-AiGridAgent',
+        'Send-AiGridText',
+        'Remove-AiGridWorktree'
+    )
     CmdletsToExport   = @()
     VariablesToExport = @()
     AliasesToExport   = @()
